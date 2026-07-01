@@ -351,13 +351,6 @@ MIT License - Free to use and modify
 - **LangChain Docs**: https://python.langchain.com
 - **FastAPI Docs**: https://fastapi.tiangolo.com
 
-## 💬 Questions?
-
-Open an issue or reach out:
-- Email: pranjalisr25@gmail.com
-- LinkedIn: https://linkedin.com/in/pranjalisr
-- GitHub: @pranjalisr
-
 ---
 
 **Built with ❤️ by [Pranjali SR](https://github.com/pranjalisr)**
