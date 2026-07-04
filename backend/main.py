@@ -389,40 +389,48 @@ def score_result(title: str, description: str, domain: Optional[str]) -> float:
     
     return max(0.1, score)  # Don't go below 0.1
 
+def _fetch_hf_datasets(search_terms: str) -> list:
+    """Fetch datasets from the HuggingFace search API for a given term string."""
+    headers = {"User-Agent": "Mozilla/5.0"}
+    url = "https://huggingface.co/api/datasets"
+    params = {"search": search_terms, "sort": "likes", "direction": "-1"}
+    response = requests.get(url, headers=headers, params=params, timeout=10)
+    if response.status_code == 200:
+        return response.json()
+    return []
+
 def search_huggingface_datasets(query: str, domain: Optional[str]) -> str:
     """Search HuggingFace with domain-aware ranking."""
     try:
-        headers = {"User-Agent": "Mozilla/5.0"}
-        search_terms = " ".join(query.split()[:4])
-        url = f"https://huggingface.co/api/datasets?search={search_terms}&sort=likes&direction=-1"
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            datasets = response.json()
-            
-            # Score and filter
-            scored = []
-            for ds in datasets:
-                title = ds.get('id', '')
-                desc = ds.get('description', '') or ''
-                score = score_result(title, desc, domain)
-                if score > 0.4:  # Only keep reasonably relevant results
-                    scored.append((score, ds))
-            
-            if not scored:
-                return f"No highly relevant datasets found on HuggingFace for '{query}'."
-            
-            scored.sort(key=lambda x: x[0], reverse=True)
-            top_datasets = [ds for score, ds in scored[:5]]
-            
-            result = f"HuggingFace Datasets:\n\n"
-            for i, dataset in enumerate(top_datasets, 1):
-                result += f"{i}. **{dataset.get('id', 'Unknown')}**\n"
-                result += f"   Downloads: {dataset.get('downloads', 0)}\n"
-                result += f"   Likes: {dataset.get('likes', 0)}\n"
-                result += f"   URL: https://huggingface.co/datasets/{dataset.get('id', '')}\n\n"
-            return result
-        return f"No datasets found on HuggingFace."
+        # HF's search API ANDs tokens with no fuzziness, so recall collapses
+        # fast as word count grows. Start narrow, then widen if empty.
+        words = query.split()
+        datasets = _fetch_hf_datasets(" ".join(words[:2]))
+        if not datasets and len(words) > 1:
+            datasets = _fetch_hf_datasets(words[0])
+
+        # Score and filter
+        scored = []
+        for ds in datasets:
+            title = ds.get('id', '')
+            desc = ds.get('description', '') or ''
+            score = score_result(title, desc, domain)
+            if score > 0.4:  # Only keep reasonably relevant results
+                scored.append((score, ds))
+
+        if not scored:
+            return f"No highly relevant datasets found on HuggingFace for '{query}'."
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_datasets = [ds for score, ds in scored[:5]]
+
+        result = f"HuggingFace Datasets:\n\n"
+        for i, dataset in enumerate(top_datasets, 1):
+            result += f"{i}. **{dataset.get('id', 'Unknown')}**\n"
+            result += f"   Downloads: {dataset.get('downloads', 0)}\n"
+            result += f"   Likes: {dataset.get('likes', 0)}\n"
+            result += f"   URL: https://huggingface.co/datasets/{dataset.get('id', '')}\n\n"
+        return result
     except Exception as e:
         logger.warning(f"HuggingFace search error: {e}")
         return f"Could not fetch HuggingFace datasets."
@@ -461,75 +469,70 @@ def search_kaggle_datasets(query: str, domain: str = "") -> str:
     else:
         return f"Kaggle Datasets:\n\nSearch on Kaggle: https://kaggle.com/search?q={query.replace(' ', '+')}\n"
 
+def _fetch_github_repos(search_terms: str) -> list:
+    """Fetch repos from the GitHub search API for a given term string."""
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/vnd.github.v3+json"
+    }
+    url = "https://api.github.com/search/repositories"
+    params = {"q": f"{search_terms} topic:dataset", "sort": "stars", "order": "desc", "per_page": 10}
+    response = requests.get(url, headers=headers, params=params, timeout=10)
+    if response.status_code == 200:
+        return response.json().get("items", [])
+    return []
+
 def search_github_datasets(query: str, domain: Optional[str]) -> str:
     """Search GitHub with domain-aware ranking."""
     try:
-        headers = {
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "application/vnd.github.v3+json"
-        }
-        search_terms = " ".join(query.split()[:3])
-        url = f"https://api.github.com/search/repositories?q={search_terms}+topic:dataset&sort=stars&order=desc&per_page=10"
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            repos = response.json().get("items", [])
-            
-            # Score and filter - STRICT filtering for churn
-            scored = []
-            for repo in repos:
-                title = repo['name']
-                desc = repo.get('description', '') or ''
-                
-                title_text = title.lower()
-                desc_text = desc.lower()
-                full_text = f"{title_text} {desc_text}"
+        # GitHub ANDs all query terms, so recall collapses fast on niche
+        # topics. Start at 3 words, narrow down until something matches.
+        words = query.split()
+        repos = []
+        for n in (3, 2, 1):
+            if n > len(words):
+                continue
+            repos = _fetch_github_repos(" ".join(words[:n]))
+            if repos:
+                break
 
-                # Strict filter: only include repos with churn keywords
-                full_text = f"{title} {desc}".lower()
-                has_churn_keywords = (
-                    "churn" in full_text
-                    or "telecom" in full_text
-                    or "customer attrition" in full_text
-                    or "customer retention" in full_text
-                )
-                
-                # Optional: allow strong description match only if title is not generic
-                generic_title_words = [
-                    "data-analysis-projects",
-                    "machine-learning-projects",
-                    "data-science-projects",
-                    "ml-projects",
-                    "kaggle-projects"
-                ]
-                is_generic_title = any(word in title_text for word in generic_title_words)
+        # Score and filter
+        scored = []
+        for repo in repos:
+            title = repo['name']
+            desc = repo.get('description', '') or ''
+            title_text = title.lower()
 
-                if is_generic_title:
-                    continue
-                    
-                print("GITHUB CHECK:", title, "|", has_churn_keywords)
+            # Skip repos with generic, low-signal titles regardless of domain
+            generic_title_words = [
+                "data-analysis-projects",
+                "machine-learning-projects",
+                "data-science-projects",
+                "ml-projects",
+                "kaggle-projects"
+            ]
+            is_generic_title = any(word in title_text for word in generic_title_words)
 
-                if not has_churn_keywords:
-                    continue  # Skip repos without churn keywords
-                
-                score = score_result(title, desc, domain)
-                if score > 0.35:
-                    scored.append((score, repo))
-            
-            if not scored:
-                return f"No highly relevant GitHub repositories found."
-            
-            scored.sort(key=lambda x: x[0], reverse=True)
-            top_repos = [repo for score, repo in scored[:5]]
-            
-            result = f"GitHub Repositories:\n\n"
-            for i, repo in enumerate(top_repos, 1):
-                result += f"{i}. **{repo['name']}** by {repo['owner']['login']}\n"
-                result += f"   Stars: {repo['stargazers_count']}\n"
-                result += f"   {repo.get('description', 'N/A')[:80]}\n"
-                result += f"   URL: {repo['html_url']}\n\n"
-            return result
-        return f"No GitHub datasets found."
+            if is_generic_title:
+                continue
+
+            score = score_result(title, desc, domain)
+            if score > 0.35:
+                scored.append((score, repo))
+
+        if not scored:
+            return f"No highly relevant GitHub repositories found."
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+        top_repos = [repo for score, repo in scored[:5]]
+
+        result = f"GitHub Repositories:\n\n"
+        for i, repo in enumerate(top_repos, 1):
+            result += f"{i}. **{repo['name']}** by {repo['owner']['login']}\n"
+            result += f"   Stars: {repo['stargazers_count']}\n"
+            result += f"   {repo.get('description', 'N/A')[:80]}\n"
+            result += f"   URL: {repo['html_url']}\n\n"
+        return result
     except Exception as e:
         logger.warning(f"GitHub search error: {e}")
         return f"Could not fetch GitHub datasets."
@@ -539,17 +542,24 @@ def search_arxiv_papers(query: str) -> str:
     try:
         headers = {"User-Agent": "Mozilla/5.0"}
         search_terms = " AND ".join(query.split()[:3])
-        url = f"http://export.arxiv.org/api/query?search_query=cat:cs.LG+AND+all:{search_terms}&start=0&max_results=5&sortBy=submittedDate&sortOrder=descending"
+        url = f"http://export.arxiv.org/api/query?search_query=cat:cs.LG+AND+all:{search_terms}&start=0&max_results=5&sortBy=relevance&sortOrder=descending"
         response = requests.get(url, headers=headers, timeout=10)
-        
+
         if response.status_code == 200:
             result = f"ArXiv Papers:\n\n"
             lines = response.text.split('\n')
             count = 0
+            in_entry = False
             for line in lines:
-                if '<title>' in line and count < 5:
+                if '<entry>' in line:
+                    in_entry = True
+                    continue
+                if '</entry>' in line:
+                    in_entry = False
+                    continue
+                if in_entry and '<title>' in line and count < 5:
                     title = line.replace('<title>', '').replace('</title>', '').strip()
-                    if title and title != 'ArXiv API':
+                    if title:
                         count += 1
                         result += f"{count}. {title}\n"
             if count > 0:
